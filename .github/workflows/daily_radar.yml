@@ -1,16 +1,18 @@
-name: Daily TW Stock Radar
+name: TW Stock Radar & Intraday Monitor
 
 on:
   schedule:
-    # GitHub 使用 UTC 時間，台灣時間 17:30 = UTC 時間 09:30 (週一至週五)
+    # 1. 盤後選股雷達：台灣時間週一至週五 17:30 (UTC 09:30)
     - cron: '30 9 * * 1-5'
-  workflow_dispatch: # 允許在網頁上手動點擊按鈕測試執行
+    # 2. 盤中到價監控：台灣時間週一至週五 09:00~13:30 每 10 分鐘檢查一次 (UTC 01:00~05:30)
+    - cron: '*/10 1-5 * * 1-5'
+  workflow_dispatch:
 
 permissions:
-  contents: write # 允許自動將更新後的 SQLite 資料庫存回倉庫
+  contents: write
 
 jobs:
-  run-screener:
+  stock-bot:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -24,17 +26,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run stock radar script
+      - name: Run Post-Market Radar or Intraday Monitor
         env:
-          # 從 GitHub Secrets 讀取敏感資訊，避免 Token 外洩
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python tw_stock_radar.py
+        run: |
+          # 取得目前台灣時間的小時 (UTC+8)
+          TW_HOUR=$(TZ='Asia/Taipei' date +%H)
+          if [ "$TW_HOUR" -ge 15 ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "執行盤後選股與建庫..."
+            python tw_stock_radar.py
+          else
+            echo "執行盤中到價監控..."
+            python intraday_monitor.py
+          fi
 
       - name: Commit and push updated SQLite DB
         run: |
           git config --global user.name "StockRadarBot"
           git config --global user.email "bot@users.noreply.github.com"
           git add tw_stock_history.db
-          git commit -m "Update daily stock data" || exit 0
+          git commit -m "Update stock DB and watchlist signals" || exit 0
           git push
