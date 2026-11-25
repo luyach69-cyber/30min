@@ -340,62 +340,77 @@ def run_market_screener(
     return pd.DataFrame(selected_stocks)
 
 
-# ==========================================
-# 6. 戰報格式化與 Telegram 推播模組
+ # ==========================================
+# 6. 戰報格式化與 Telegram 推播模組 (改用 HTML 模式避免股票名稱符號衝突)
 # ==========================================
 def format_screener_alert(df_hits: pd.DataFrame, date_str: str) -> str:
-    """將篩選出的股票 DataFrame 轉換為包含中文名稱與建議進場價的戰報格式"""
-    if df_hits.empty:
-        return f'📊 *【{date_str} 盤後起漲雷達】*\n今日無符合「連跌止跌＋法人轉買」條件之標的。'
+  """將篩選出的股票 DataFrame 轉換為包含中文名稱與建議進場價的戰報格式"""
+  if df_hits.empty:
+    return (
+        f'📊 <b>【{date_str}'
+        ' 盤後起漲雷達】</b>\n今日無符合「連跌止跌＋法人轉買」條件之標的。'
+    )
 
-    lines = [
-        f'🎯 *【{date_str} 盤後起漲雷達】*',
-        f'共篩選出 *{len(df_hits)}* 檔籌碼轉折標的（已自動加入盤中到價監控）：\n',
-    ]
+  lines = [
+      f'🎯 <b>【{date_str} 盤後起漲雷達】</b>',
+      f'共篩選出 <b>{len(df_hits)}</b> 檔籌碼轉折標的（已自動加入盤中到價監控）：\n',
+  ]
 
-    for _, row in df_hits.iterrows():
-        stock_id = row['stock_id']
-        name = row['stock_name']
-        close = row['close']
-        entry = row['suggested_entry']
-        sl = row['stop_loss']
-        foreign = int(row['foreign_net'])
-        total_inst = int(row['total_inst_net'])
-        vol = int(row['volume'])
+  for _, row in df_hits.iterrows():
+    stock_id = row['stock_id']
+    # 避免股票名稱內含 < 或 > 導致 HTML 標籤錯誤
+    name = (
+        str(row['stock_name'])
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+    )
+    close = row['close']
+    entry = row['suggested_entry']
+    sl = row['stop_loss']
+    foreign = int(row['foreign_net'])
+    total_inst = int(row['total_inst_net'])
+    vol = int(row['volume'])
 
-        item_text = (
-            f'🔹 *{stock_id} {name}* | 收盤: `{close}`\n'
-            f'   💡 建議進場: `{entry}` | 防守停損: `{sl}`\n'
-            f'   外資: `+{foreign}張` | 法人合計: `+{total_inst}張` | 量: `{vol}張`\n'
-            f'   👉 [查看YahooK線](https://tw.stock.yahoo.com/quote/{stock_id})'
-        )
-        lines.append(item_text)
+    item_text = (
+        f'🔹 <b>{stock_id} {name}</b> | 收盤: <code>{close}</code>\n   💡'
+        f' 建議進場: <code>{entry}</code> | 防守停損: <code>{sl}</code>\n  '
+        f' 外資: <code>+{foreign}張</code> | 法人合計:'
+        f' <code>+{total_inst}張</code> | 量: <code>{vol}張</code>\n   👉 <a'
+        f' href="https://tw.stock.yahoo.com/quote/{stock_id}">查看YahooK線</a>'
+    )
+    lines.append(item_text)
 
-    return '\n'.join(lines)
+  return '\n'.join(lines)
 
 
 def send_telegram_message(message: str):
-    """發送文字訊息至指定的 Telegram 聊天室"""
-    if not TG_BOT_TOKEN or TG_BOT_TOKEN == '你的_BOT_TOKEN' or not TG_CHAT_ID or TG_CHAT_ID == '你的_CHAT_ID':
-        print('⚠️ 尚未設定 Telegram Token 或 Chat ID，略過推播。訊息預覽如下：\n')
-        print(message)
-        return
+  """發送文字訊息至指定的 Telegram 聊天室"""
+  if (
+      not TG_BOT_TOKEN
+      or TG_BOT_TOKEN == '你的_BOT_TOKEN'
+      or not TG_CHAT_ID
+      or TG_CHAT_ID == '你的_CHAT_ID'
+  ):
+    print('⚠️ 尚未設定 Telegram Token 或 Chat ID，略過推播。訊息預覽如下：\n')
+    print(message)
+    return
 
-    url = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage'
-    payload = {
-        'chat_id': TG_CHAT_ID,
-        'text': message,
-        'parse_mode': 'Markdown',
-        'disable_web_page_preview': True,
-    }
-    try:
-        res = requests.post(url, json=payload, timeout=10)
-        if res.status_code == 200:
-            print('✅ Telegram 通知發送成功！')
-        else:
-            print(f'❌ Telegram 發送失敗: {res.text}')
-    except Exception as e:
-        print(f'❌ 發送過程發生錯誤: {e}')
+  url = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage'
+  payload = {
+      'chat_id': TG_CHAT_ID,
+      'text': message,
+      'parse_mode': 'HTML',  # 改用 HTML 解析器，徹底解決星號/底線報錯
+      'disable_web_page_preview': True,
+  }
+  try:
+    res = requests.post(url, json=payload, timeout=10)
+    if res.status_code == 200:
+      print('✅ Telegram 通知發送成功！')
+    else:
+      print(f'❌ Telegram 發送失敗: {res.text}')
+  except Exception as e:
+    print(f'❌ 發送過程發生錯誤: {e}')
 
 
 # ==========================================
