@@ -13,9 +13,10 @@ TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '你的_BOT_TOKEN')
 TG_CHAT_ID = os.getenv('TG_CHAT_ID', '你的_CHAT_ID')
 
 # 選股參數設定
-LOOKBACK_DAYS = 3      # 觀察前期連跌與賣超的天數 (預設 3 天)
-MIN_BUY_VOL = 500      # 轉買當日最低買超張數門檻 (張)
-MIN_DAILY_VOL = 1000   # 最低成交量門檻，過濾冷門股 (張)
+LOOKBACK_DAYS = 3        # 觀察前期連跌與賣超的天數 (預設 3 天)
+MIN_BUY_VOL = 500        # 轉買當日最低買超張數門檻 (張)
+MIN_DAILY_VOL = 1000     # 最低成交量門檻，過濾冷門股 (張)
+MIN_INST_RATIO = 0.15    # 籌碼集中度門檻：法人合計買超佔當日成交量比例 (0.15 = 15%)
 
 
 # ==========================================
@@ -26,7 +27,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # 表 1：全市場每日歷史價量與籌碼 (新增 stock_name, open, high, low 供計算進場價與支撐)
+    # 表 1：全市場每日歷史價量與籌碼
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS daily_chip_price (
             stock_id TEXT,
@@ -47,7 +48,7 @@ def init_db():
         'CREATE INDEX IF NOT EXISTS idx_stock_date ON daily_chip_price (stock_id, date)'
     )
 
-    # 表 2：盤後雷達選出標的與建議進場價追蹤表 (用於盤中價格達標監控與後續勝率統計)
+    # 表 2：盤後雷達選出標的與建議進場價追蹤表
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS watchlist_signals (
             signal_date TEXT,
@@ -63,7 +64,7 @@ def init_db():
         )
     """)
 
-    # 舊版資料庫相容性自動升級 (若原本沒有新欄位則自動補上)
+    # 舊版資料庫相容性自動升級
     existing_cols = [
         row[1] for row in cursor.execute("PRAGMA table_info(daily_chip_price)").fetchall()
     ]
@@ -241,6 +242,7 @@ def run_market_screener(
     lookback_days: int = LOOKBACK_DAYS,
     min_buy_vol: int = MIN_BUY_VOL,
     min_daily_vol: int = MIN_DAILY_VOL,
+    min_inst_ratio: float = MIN_INST_RATIO,
 ) -> pd.DataFrame:
     """從本地 SQLite 讀取最新交易日資料，執行選股並計算建議進場價與停損參考"""
     conn = sqlite3.connect(DB_PATH)
@@ -287,8 +289,11 @@ def run_market_screener(
         )
         liquid_enough = today['volume'] >= min_daily_vol
 
-        if all([price_falling, price_stabilized, prev_inst_sell, today_inst_buy, liquid_enough]):
-            # 計算建議進場價：取「今日收盤折讓 1% (拉回低接)」與「今日實體紅K中點」的較低保守價位
+        # 新增條件 6：籌碼集中度過濾 (法人買超佔今日成交量 >= 15%，過濾牛皮大型股)
+        inst_ratio = (today['total_inst_net'] / today['volume']) if today['volume'] > 0 else 0
+        high_concentration = inst_ratio >= min_inst_ratio
+
+        if all([price_falling, price_stabilized, prev_inst_sell, today_inst_buy, liquid_enough, high_concentration]):
             close_p = float(today['close'])
             open_p = float(today['open']) if pd.notna(today['open']) else close_p
             low_p = float(today['low']) if pd.notna(today['low']) else close_p
@@ -297,7 +302,6 @@ def run_market_screener(
             k_midpoint = (open_p + close_p) / 2 if close_p > open_p else close_p * 0.995
             suggested_entry = round_to_tw_tick(min(pullback_1pct, k_midpoint))
 
-            # 參考防守停損價：波段最低點再往下 2%
             period_low = min(low_p, float(prev_days['low'].min())) if pd.notna(prev_days['low'].min()) else close_p * 0.95
             stop_loss = round_to_tw_tick(period_low * 0.98)
 
@@ -313,9 +317,9 @@ def run_market_screener(
                 'foreign_net': today['foreign_net'],
                 'total_inst_net': today['total_inst_net'],
                 'volume': today['volume'],
+                'inst_ratio_pct': round(inst_ratio * 100, 1),
             })
 
-    # 將篩選結果寫入 watchlist_signals 追蹤表，供隔日盤中價格監控與歷史績效統計
     if selected_stocks:
         cursor = conn.cursor()
         for item in selected_stocks:
@@ -340,77 +344,71 @@ def run_market_screener(
     return pd.DataFrame(selected_stocks)
 
 
- # ==========================================
-# 6. 戰報格式化與 Telegram 推播模組 (改用 HTML 模式避免股票名稱符號衝突)
+# ==========================================
+# 6. 戰報格式化與 Telegram 推播模組 (HTML 模式)
 # ==========================================
 def format_screener_alert(df_hits: pd.DataFrame, date_str: str) -> str:
-  """將篩選出的股票 DataFrame 轉換為包含中文名稱與建議進場價的戰報格式"""
-  if df_hits.empty:
-    return (
-        f'📊 <b>【{date_str}'
-        ' 盤後起漲雷達】</b>\n今日無符合「連跌止跌＋法人轉買」條件之標的。'
-    )
+    """將篩選出的股票 DataFrame 轉換為包含中文名稱與建議進場價的戰報格式"""
+    if df_hits.empty:
+        return (
+            f'📊 <b>【{date_str} 盤後起漲雷達】</b>\n'
+            '今日無符合「連跌止跌＋法人轉買＋集中度≥15%」條件之標的。'
+        )
 
-  lines = [
-      f'🎯 <b>【{date_str} 盤後起漲雷達】</b>',
-      f'共篩選出 <b>{len(df_hits)}</b> 檔籌碼轉折標的（已自動加入盤中到價監控）：\n',
-  ]
+    lines = [
+        f'🎯 <b>【{date_str} 盤後起漲雷達】</b>',
+        f'共篩選出 <b>{len(df_hits)}</b> 檔高集中度籌碼轉折標的（已加入盤中監控）：\n',
+    ]
 
-  for _, row in df_hits.iterrows():
-    stock_id = row['stock_id']
-    # 避免股票名稱內含 < 或 > 導致 HTML 標籤錯誤
-    name = (
-        str(row['stock_name'])
-        .replace('&', '&amp;')
-        .replace('<', '&lt;')
-        .replace('>', '&gt;')
-    )
-    close = row['close']
-    entry = row['suggested_entry']
-    sl = row['stop_loss']
-    foreign = int(row['foreign_net'])
-    total_inst = int(row['total_inst_net'])
-    vol = int(row['volume'])
+    for _, row in df_hits.iterrows():
+        stock_id = row['stock_id']
+        name = (
+            str(row['stock_name'])
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+        )
+        close = row['close']
+        entry = row['suggested_entry']
+        sl = row['stop_loss']
+        foreign = int(row['foreign_net'])
+        total_inst = int(row['total_inst_net'])
+        vol = int(row['volume'])
+        ratio_pct = row['inst_ratio_pct']
 
-    item_text = (
-        f'🔹 <b>{stock_id} {name}</b> | 收盤: <code>{close}</code>\n   💡'
-        f' 建議進場: <code>{entry}</code> | 防守停損: <code>{sl}</code>\n  '
-        f' 外資: <code>+{foreign}張</code> | 法人合計:'
-        f' <code>+{total_inst}張</code> | 量: <code>{vol}張</code>\n   👉 <a'
-        f' href="https://tw.stock.yahoo.com/quote/{stock_id}">查看YahooK線</a>'
-    )
-    lines.append(item_text)
+        item_text = (
+            f'🔹 <b>{stock_id} {name}</b> | 收盤: <code>{close}</code>\n'
+            f'   💡 建議進場: <code>{entry}</code> | 防守停損: <code>{sl}</code>\n'
+            f'   外資: <code>+{foreign}張</code> | 法人合計: <code>+{total_inst}張</code> (佔量 <code>{ratio_pct}%</code>)\n'
+            f'   成交量: <code>{vol}張</code> | 👉 <a href="https://tw.stock.yahoo.com/quote/{stock_id}">查看YahooK線</a>'
+        )
+        lines.append(item_text)
 
-  return '\n'.join(lines)
+    return '\n'.join(lines)
 
 
 def send_telegram_message(message: str):
-  """發送文字訊息至指定的 Telegram 聊天室"""
-  if (
-      not TG_BOT_TOKEN
-      or TG_BOT_TOKEN == '你的_BOT_TOKEN'
-      or not TG_CHAT_ID
-      or TG_CHAT_ID == '你的_CHAT_ID'
-  ):
-    print('⚠️ 尚未設定 Telegram Token 或 Chat ID，略過推播。訊息預覽如下：\n')
-    print(message)
-    return
+    """發送文字訊息至指定的 Telegram 聊天室"""
+    if not TG_BOT_TOKEN or TG_BOT_TOKEN == '你的_BOT_TOKEN' or not TG_CHAT_ID or TG_CHAT_ID == '你的_CHAT_ID':
+        print('⚠️ 尚未設定 Telegram Token 或 Chat ID，略過推播。訊息預覽如下：\n')
+        print(message)
+        return
 
-  url = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage'
-  payload = {
-      'chat_id': TG_CHAT_ID,
-      'text': message,
-      'parse_mode': 'HTML',  # 改用 HTML 解析器，徹底解決星號/底線報錯
-      'disable_web_page_preview': True,
-  }
-  try:
-    res = requests.post(url, json=payload, timeout=10)
-    if res.status_code == 200:
-      print('✅ Telegram 通知發送成功！')
-    else:
-      print(f'❌ Telegram 發送失敗: {res.text}')
-  except Exception as e:
-    print(f'❌ 發送過程發生錯誤: {e}')
+    url = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage'
+    payload = {
+        'chat_id': TG_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            print('✅ Telegram 通知發送成功！')
+        else:
+            print(f'❌ Telegram 發送失敗: {res.text}')
+    except Exception as e:
+        print(f'❌ 發送過程發生錯誤: {e}')
 
 
 # ==========================================
@@ -419,7 +417,6 @@ def send_telegram_message(message: str):
 if __name__ == '__main__':
     init_db()
 
-    # 若資料庫天數不足 4 天，或舊資料缺少中文名稱欄位，自動補齊近 10 天完整資料
     conn = sqlite3.connect(DB_PATH)
     missing_names = pd.read_sql_query(
         'SELECT COUNT(*) as c FROM daily_chip_price WHERE stock_name IS NULL OR stock_name = ""',
